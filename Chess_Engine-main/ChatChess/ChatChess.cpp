@@ -1,278 +1,397 @@
+// Chess engine: 64-square mailbox board, legal move generation, negamax + alpha-beta, UCI.
+// Square index: 0 = a8 ... 7 = h8 ... 56 = a1 ... 63 = h1   (row = i/8, col = i%8)
+// Pieces: white positive, black negative (PAWN..KING = 1..6)
 #include <iostream>
 #include <vector>
 #include <string>
 #include <sstream>
 #include <algorithm>
-
+#include <cstdlib>
 using namespace std;
 
-enum Piece
+enum Piece { EMPTY = 0, PAWN = 1, KNIGHT = 2, BISHOP = 3, ROOK = 4, QUEEN = 5, KING = 6 };
+enum Castle { WK = 1, WQ = 2, BK = 4, BQ = 8 };
+
+const int VALUE[7] = {0, 100, 320, 330, 500, 900, 0};
+const int MATE = 100000;
+const int INF = 1000000;
+const char *START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+const int DR[8] = {-1, 1, 0, 0, -1, -1, 1, 1}; // 0-3 rook dirs, 4-7 bishop dirs
+const int DC[8] = {0, 0, -1, 1, -1, 1, -1, 1};
+const int KR[8] = {-2, -2, -1, -1, 1, 1, 2, 2};
+const int KC[8] = {-1, 1, -2, 2, -2, 2, -1, 1};
+
+inline bool onBoard(int r, int c) { return r >= 0 && r < 8 && c >= 0 && c < 8; }
+
+struct Move
 {
-    EMPTY = 0,
-    WPAWN = 1,
-    WKNIGHT = 2,
-    WBISHOP = 3,
-    WROOK = 4,
-    WQUEEN = 5,
-    WKING = 6,
-    BPAWN = -1,
-    BKNIGHT = -2,
-    BBISHOP = -3,
-    BROOK = -4,
-    BQUEEN = -5,
-    BKING = -6
+    int from, to, promo; // promo = 0 or KNIGHT..QUEEN
 };
 
-class ChessBoard
+// ===================== Board: representation, move generation, make =====================
+struct Board
 {
-public:
-    int board[64];
+    int sq[64];
     bool whiteToMove;
+    int castle; // bitmask of Castle
+    int ep;     // en-passant target square or -1
 
-    ChessBoard() { reset(); }
+    Board() { setFen(START_FEN); }
 
-    void reset()
+    void setFen(const string &fen)
     {
-        int initial[] = {
-            BROOK, BKNIGHT, BBISHOP, BQUEEN, BKING, BBISHOP, BKNIGHT, BROOK,
-            BPAWN, BPAWN, BPAWN, BPAWN, BPAWN, BPAWN, BPAWN, BPAWN,
-            EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-            EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-            EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-            EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-            WPAWN, WPAWN, WPAWN, WPAWN, WPAWN, WPAWN, WPAWN, WPAWN,
-            WROOK, WKNIGHT, WBISHOP, WQUEEN, WKING, WBISHOP, WKNIGHT, WROOK};
-        copy(begin(initial), end(initial), board);
-        whiteToMove = true;
-    }
-
-    string squareToAlgebraic(int sq)
-    {
-        return string(1, 'a' + (sq % 8)) + string(1, '8' - (sq / 8));
-    }
-
-    int squareFromAlgebraic(const string &s)
-    {
-        return (8 - (s[1] - '0')) * 8 + (s[0] - 'a');
-    }
-
-    bool isWhite(int piece) const { return piece > 0; }
-    bool isBlack(int piece) const { return piece < 0; }
-
-    bool makeMove(const string &uciMove)
-    {
-        int from = squareFromAlgebraic(uciMove.substr(0, 2));
-        int to = squareFromAlgebraic(uciMove.substr(2, 2));
-        int piece = board[from];
-
-        if ((whiteToMove && !isWhite(piece)) || (!whiteToMove && !isBlack(piece)))
-            return false;
-
-        auto legalMoves = generateMoves();
-        for (auto &move : legalMoves)
+        fill(sq, sq + 64, EMPTY);
+        istringstream in(fen);
+        string place, side, rights, epStr;
+        in >> place >> side >> rights >> epStr;
+        int i = 0;
+        for (char ch : place)
         {
-            if (move.first == from && move.second == to)
+            if (ch == '/') continue;
+            if (isdigit(ch)) { i += ch - '0'; continue; }
+            int t = 0;
+            switch (tolower(ch))
             {
-                board[to] = piece;
-                board[from] = EMPTY;
-                whiteToMove = !whiteToMove;
-                return true;
+            case 'p': t = PAWN; break;
+            case 'n': t = KNIGHT; break;
+            case 'b': t = BISHOP; break;
+            case 'r': t = ROOK; break;
+            case 'q': t = QUEEN; break;
+            case 'k': t = KING; break;
+            }
+            sq[i++] = isupper(ch) ? t : -t;
+        }
+        whiteToMove = (side != "b");
+        castle = 0;
+        for (char ch : rights)
+        {
+            if (ch == 'K') castle |= WK;
+            if (ch == 'Q') castle |= WQ;
+            if (ch == 'k') castle |= BK;
+            if (ch == 'q') castle |= BQ;
+        }
+        ep = (epStr.size() == 2 && epStr != "-") ? fromAlg(epStr) : -1;
+    }
+
+    static int fromAlg(const string &s) { return (8 - (s[1] - '0')) * 8 + (s[0] - 'a'); }
+    static string toAlg(int s) { return string(1, 'a' + s % 8) + string(1, '8' - s / 8); }
+
+    // Is square t attacked by the given side?
+    bool attacked(int t, bool byWhite) const
+    {
+        int tr = t / 8, tc = t % 8, s = byWhite ? 1 : -1;
+        int pr = tr + (byWhite ? 1 : -1); // an attacking pawn sits one row "behind" the target
+        for (int dc : {-1, 1})
+            if (onBoard(pr, tc + dc) && sq[pr * 8 + tc + dc] == s * PAWN) return true;
+        for (int k = 0; k < 8; k++)
+        {
+            int r = tr + KR[k], c = tc + KC[k];
+            if (onBoard(r, c) && sq[r * 8 + c] == s * KNIGHT) return true;
+        }
+        for (int d = 0; d < 8; d++)
+        {
+            int r = tr + DR[d], c = tc + DC[d];
+            if (onBoard(r, c) && sq[r * 8 + c] == s * KING) return true;
+            while (onBoard(r, c))
+            {
+                int p = sq[r * 8 + c];
+                if (p != EMPTY)
+                {
+                    if (p == s * QUEEN || (d < 4 && p == s * ROOK) || (d >= 4 && p == s * BISHOP)) return true;
+                    break;
+                }
+                r += DR[d]; c += DC[d];
             }
         }
         return false;
     }
 
-    vector<pair<int, int>> generateMoves()
+    int kingSquare(bool white) const
     {
-        vector<pair<int, int>> moves;
-        int knightOffsets[] = {17, 15, 10, 6, -6, -10, -15, -17};
-        int directions[] = {1, -1, 8, -8, 7, -7, 9, -9};
+        for (int i = 0; i < 64; i++)
+            if (sq[i] == (white ? KING : -KING)) return i;
+        return -1;
+    }
 
-        for (int i = 0; i < 64; ++i)
+    bool inCheck() const { return attacked(kingSquare(whiteToMove), !whiteToMove); }
+
+    void pseudoMoves(vector<Move> &out) const
+    {
+        int me = whiteToMove ? 1 : -1;
+        for (int i = 0; i < 64; i++)
         {
-            int piece = board[i];
-            if (piece == EMPTY)
-                continue;
-            if ((whiteToMove && isBlack(piece)) || (!whiteToMove && isWhite(piece)))
-                continue;
-
-            if (abs(piece) == WPAWN)
+            int p = sq[i];
+            if (p * me <= 0) continue;
+            int type = abs(p), r = i / 8, c = i % 8;
+            if (type == PAWN)
             {
-                int dir = whiteToMove ? -8 : 8;
-                int oneAhead = i + dir;
-                if (inBounds(i, oneAhead) && board[oneAhead] == EMPTY)
-                    moves.emplace_back(i, oneAhead);
-                // Double move
-                int startRow = whiteToMove ? 6 : 1;
-                if (i / 8 == startRow && board[oneAhead] == EMPTY && board[oneAhead + dir] == EMPTY)
-                    moves.emplace_back(i, oneAhead + dir);
-                // Captures
-                for (int dx : {-1, 1})
+                int dir = whiteToMove ? -1 : 1, startRow = whiteToMove ? 6 : 1, promoRow = whiteToMove ? 0 : 7;
+                int nr = r + dir;
+                if (!onBoard(nr, c)) continue;
+                auto add = [&](int to) {
+                    if (to / 8 == promoRow) for (int pr : {QUEEN, ROOK, BISHOP, KNIGHT}) out.push_back({i, to, pr});
+                    else out.push_back({i, to, 0});
+                };
+                if (sq[nr * 8 + c] == EMPTY)
                 {
-                    int target = i + dir + dx;
-                    if (inBounds(i, target) && board[target] != EMPTY &&
-                        ((whiteToMove && isBlack(board[target])) || (!whiteToMove && isWhite(board[target]))))
-                        moves.emplace_back(i, target);
+                    add(nr * 8 + c);
+                    if (r == startRow && sq[(nr + dir) * 8 + c] == EMPTY) out.push_back({i, (nr + dir) * 8 + c, 0});
+                }
+                for (int dc : {-1, 1})
+                {
+                    int nc = c + dc;
+                    if (!onBoard(nr, nc)) continue;
+                    int t = nr * 8 + nc;
+                    if (sq[t] * me < 0) add(t);
+                    else if (t == ep) out.push_back({i, t, 0});
                 }
             }
-            else if (abs(piece) == WKNIGHT)
+            else if (type == KNIGHT || type == KING)
             {
-                for (int d : knightOffsets)
+                for (int k = 0; k < 8; k++)
                 {
-                    int to = i + d;
-                    if (inBounds(i, to) && (board[to] == EMPTY ||
-                                            (whiteToMove && isBlack(board[to])) || (!whiteToMove && isWhite(board[to]))))
-                        moves.emplace_back(i, to);
+                    int nr = type == KNIGHT ? r + KR[k] : r + DR[k], nc = type == KNIGHT ? c + KC[k] : c + DC[k];
+                    if (onBoard(nr, nc) && sq[nr * 8 + nc] * me <= 0) out.push_back({i, nr * 8 + nc, 0});
                 }
+                if (type == KING) castlingMoves(i, out);
             }
-            else if (abs(piece) == WBISHOP || abs(piece) == WROOK || abs(piece) == WQUEEN)
+            else
             {
-                int start = (abs(piece) == WBISHOP) ? 4 : (abs(piece) == WROOK ? 0 : 0);
-                int end = (abs(piece) == WBISHOP) ? 8 : (abs(piece) == WROOK ? 4 : 8);
-                for (int d = start; d < end; ++d)
+                int d0 = (type == BISHOP) ? 4 : 0, d1 = (type == ROOK) ? 4 : 8;
+                for (int d = d0; d < d1; d++)
                 {
-                    int to = i;
-                    while (true)
+                    int nr = r + DR[d], nc = c + DC[d];
+                    while (onBoard(nr, nc))
                     {
-                        int next = to + directions[d];
-                        if (!inBounds(to, next))
-                            break;
-                        if (board[next] != EMPTY)
-                        {
-                            if ((whiteToMove && isBlack(board[next])) || (!whiteToMove && isWhite(board[next])))
-                                moves.emplace_back(i, next);
-                            break;
-                        }
-                        moves.emplace_back(i, next);
-                        to = next;
+                        int q = sq[nr * 8 + nc];
+                        if (q * me > 0) break;
+                        out.push_back({i, nr * 8 + nc, 0});
+                        if (q != EMPTY) break;
+                        nr += DR[d]; nc += DC[d];
                     }
                 }
             }
-            else if (abs(piece) == WKING)
-            {
-                for (int d = 0; d < 8; ++d)
-                {
-                    int to = i + directions[d];
-                    if (inBounds(i, to) && (board[to] == EMPTY ||
-                                            (whiteToMove && isBlack(board[to])) || (!whiteToMove && isWhite(board[to]))))
-                        moves.emplace_back(i, to);
-                }
-            }
         }
-        return moves;
     }
 
-    bool inBounds(int from, int to)
+    void castlingMoves(int from, vector<Move> &out) const
     {
-        return to >= 0 && to < 64 && abs((from % 8) - (to % 8)) <= 2;
+        bool w = whiteToMove;
+        int home = w ? 60 : 4;
+        if (from != home || attacked(home, !w)) return;
+        int ks = w ? WK : BK, qs = w ? WQ : BQ;
+        if ((castle & ks) && sq[home + 1] == EMPTY && sq[home + 2] == EMPTY &&
+            !attacked(home + 1, !w) && !attacked(home + 2, !w))
+            out.push_back({home, home + 2, 0});
+        if ((castle & qs) && sq[home - 1] == EMPTY && sq[home - 2] == EMPTY && sq[home - 3] == EMPTY &&
+            !attacked(home - 1, !w) && !attacked(home - 2, !w))
+            out.push_back({home, home - 2, 0});
     }
 
-    int evaluate() const
+    // Apply a (pseudo-legal) move to this board.
+    void make(const Move &m)
     {
-        int score = 0;
-        for (int i = 0; i < 64; ++i)
+        int p = sq[m.from], type = abs(p), me = p > 0 ? 1 : -1;
+        if (type == PAWN && m.to == ep && sq[m.to] == EMPTY && m.from % 8 != m.to % 8)
+            sq[(m.from / 8) * 8 + m.to % 8] = EMPTY; // en-passant capture
+        sq[m.to] = m.promo ? me * m.promo : p;
+        sq[m.from] = EMPTY;
+        if (type == KING && abs(m.to - m.from) == 2) // castling: move the rook too
         {
-            int piece = board[i];
-            score += piece;
+            if (m.to > m.from) { sq[m.to - 1] = sq[m.to + 1]; sq[m.to + 1] = EMPTY; }
+            else { sq[m.to + 1] = sq[m.to - 2]; sq[m.to - 2] = EMPTY; }
         }
-        return whiteToMove ? score : -score;
+        auto strip = [&](int s) {
+            if (s == 60) castle &= ~(WK | WQ);
+            if (s == 63) castle &= ~WK;
+            if (s == 56) castle &= ~WQ;
+            if (s == 4) castle &= ~(BK | BQ);
+            if (s == 7) castle &= ~BK;
+            if (s == 0) castle &= ~BQ;
+        };
+        strip(m.from); strip(m.to);
+        ep = (type == PAWN && abs(m.to - m.from) == 16) ? (m.from + m.to) / 2 : -1;
+        whiteToMove = !whiteToMove;
+    }
+
+    // Legal moves = pseudo-legal moves that don't leave our own king attacked.
+    vector<Move> legalMoves() const
+    {
+        vector<Move> pseudo, legal;
+        pseudoMoves(pseudo);
+        for (const Move &m : pseudo)
+        {
+            Board c = *this;
+            c.make(m);
+            if (!c.attacked(c.kingSquare(whiteToMove), !whiteToMove)) legal.push_back(m);
+        }
+        return legal;
     }
 };
 
-class Engine
+// ===================== Evaluation (from side-to-move's perspective) =====================
+int evaluate(const Board &b)
 {
-public:
-    ChessBoard &board;
-
-    Engine(ChessBoard &b) : board(b) {}
-
-    pair<int, pair<int, int>> alphaBeta(int depth, int alpha, int beta, bool maximizing)
+    int score = 0;
+    for (int i = 0; i < 64; i++)
     {
-        if (depth == 0)
-            return {board.evaluate(), {-1, -1}};
+        int p = b.sq[i];
+        if (!p) continue;
+        int t = abs(p), s = p > 0 ? 1 : -1, r = i / 8, c = i % 8;
+        int v = VALUE[t];
+        int advance = p > 0 ? 7 - r : r;
+        int centrality = 6 - (abs(2 * c - 7) / 2 + abs(2 * r - 7) / 2); // 0..6
+        if (t == PAWN) v += advance * 8 + centrality * 2;
+        else if (t == KNIGHT) v += centrality * 5;
+        else if (t == BISHOP) v += centrality * 3;
+        score += s * v;
+    }
+    return b.whiteToMove ? score : -score;
+}
 
-        auto moves = board.generateMoves();
-        if (moves.empty())
-            return {board.evaluate(), {-1, -1}};
+// ===================== Search: negamax + alpha-beta =====================
+long long nodes = 0;
+bool usePruning = true;
 
-        pair<int, int> bestMove = moves[0];
-        int bestEval = maximizing ? -1e9 : 1e9;
+void orderMoves(vector<Move> &moves, const Board &b) // MVV-LVA: try captures of big pieces by small pieces first
+{
+    auto key = [&](const Move &m) {
+        int victim = abs(b.sq[m.to]), attacker = abs(b.sq[m.from]);
+        int k = victim ? 10 * VALUE[victim] - VALUE[attacker] + 10000 : 0;
+        if (m.promo) k += VALUE[m.promo];
+        return k;
+    };
+    stable_sort(moves.begin(), moves.end(), [&](const Move &a, const Move &c) { return key(a) > key(c); });
+}
 
-        for (auto &move : moves)
+int negamax(const Board &b, int depth, int alpha, int beta, int ply)
+{
+    nodes++;
+    vector<Move> moves = b.legalMoves();
+    if (moves.empty()) return b.inCheck() ? -MATE + ply : 0; // checkmate (prefer faster mates) or stalemate
+    if (depth == 0) return evaluate(b);
+    orderMoves(moves, b);
+    int best = -INF;
+    for (const Move &m : moves)
+    {
+        Board c = b;
+        c.make(m);
+        int score = -negamax(c, depth - 1, -beta, -alpha, ply + 1);
+        best = max(best, score);
+        if (usePruning)
         {
-            ChessBoard temp = board;
-            string uci = board.squareToAlgebraic(move.first) + board.squareToAlgebraic(move.second);
-            temp.makeMove(uci);
-
-            int eval = alphaBeta(depth - 1, alpha, beta, !maximizing).first;
-            if (maximizing && eval > bestEval)
-            {
-                bestEval = eval;
-                bestMove = move;
-                alpha = max(alpha, eval);
-            }
-            else if (!maximizing && eval < bestEval)
-            {
-                bestEval = eval;
-                bestMove = move;
-                beta = min(beta, eval);
-            }
-            if (beta <= alpha)
-                break;
+            alpha = max(alpha, score);
+            if (alpha >= beta) break; // beta cutoff
         }
-        return {bestEval, bestMove};
     }
+    return best;
+}
 
-    string getBestMove()
+string moveToStr(const Move &m)
+{
+    string s = Board::toAlg(m.from) + Board::toAlg(m.to);
+    if (m.promo) s += "pnbrqk"[m.promo - 1];
+    return s;
+}
+
+bool searchRoot(const Board &b, int depth, Move &bestMove, int &bestScore)
+{
+    nodes = 0;
+    vector<Move> moves = b.legalMoves();
+    if (moves.empty()) return false;
+    orderMoves(moves, b);
+    int alpha = -INF, beta = INF;
+    bestScore = -INF;
+    for (const Move &m : moves)
     {
-        auto result = alphaBeta(3, -1e9, 1e9, board.whiteToMove);
-        return board.squareToAlgebraic(result.second.first) + board.squareToAlgebraic(result.second.second);
+        Board c = b;
+        c.make(m);
+        int score = -negamax(c, depth - 1, -beta, -alpha, 1);
+        if (score > bestScore) { bestScore = score; bestMove = m; }
+        if (usePruning) alpha = max(alpha, score);
     }
-};
+    return true;
+}
+
+// ===================== Testing aid: perft =====================
+long long perft(const Board &b, int d)
+{
+    vector<Move> ms = b.legalMoves();
+    if (d == 1) return (long long)ms.size();
+    long long n = 0;
+    for (const Move &m : ms) { Board c = b; c.make(m); n += perft(c, d - 1); }
+    return n;
+}
+
+// ===================== UCI =====================
+bool applyUciMove(Board &b, const string &s)
+{
+    if (s.size() < 4) return false;
+    int from = Board::fromAlg(s.substr(0, 2)), to = Board::fromAlg(s.substr(2, 2)), promo = 0;
+    if (s.size() >= 5)
+    {
+        char ch = tolower(s[4]);
+        promo = ch == 'n' ? KNIGHT : ch == 'b' ? BISHOP : ch == 'r' ? ROOK : ch == 'q' ? QUEEN : 0;
+    }
+    for (const Move &m : b.legalMoves()) // move validation: must be in the legal move list
+        if (m.from == from && m.to == to && m.promo == promo) { b.make(m); return true; }
+    return false;
+}
 
 void uciLoop()
 {
-    ChessBoard board;
-    Engine engine(board);
+    Board board;
     string line;
     while (getline(cin, line))
     {
         istringstream iss(line);
-        string cmd;
-        iss >> cmd;
+        vector<string> tok;
+        for (string t; iss >> t;) tok.push_back(t);
+        if (tok.empty()) continue;
+        const string &cmd = tok[0];
         if (cmd == "uci")
-        {
-            cout << "id name SimpleChess\nid author ChatGPT\nuciok\n";
-        }
-        else if (cmd == "isready")
-        {
-            cout << "readyok\n";
-        }
+            cout << "id name ChatChess\nid author Manav Rathi\nuciok" << endl;
+        else if (cmd == "isready") cout << "readyok" << endl;
+        else if (cmd == "ucinewgame") board.setFen(START_FEN);
         else if (cmd == "position")
         {
-            string type;
-            iss >> type;
-            if (type == "startpos")
+            size_t i = 1;
+            if (i < tok.size() && tok[i] == "startpos") { board.setFen(START_FEN); i++; }
+            else if (i < tok.size() && tok[i] == "fen")
             {
-                board.reset();
-                string token;
-                if (iss >> token && token == "moves")
-                {
-                    string move;
-                    while (iss >> move)
-                        board.makeMove(move);
-                }
+                string fen;
+                for (i++; i < tok.size() && tok[i] != "moves"; i++) fen += tok[i] + " ";
+                board.setFen(fen);
             }
+            if (i < tok.size() && tok[i] == "moves")
+                for (i++; i < tok.size(); i++)
+                    if (!applyUciMove(board, tok[i])) break;
         }
         else if (cmd == "go")
         {
-            string bestMove = engine.getBestMove();
-            cout << "bestmove " << bestMove << "\n";
+            int depth = 3, perftDepth = 0;
+            usePruning = true;
+            for (size_t i = 1; i < tok.size(); i++)
+            {
+                if (tok[i] == "depth" && i + 1 < tok.size()) depth = stoi(tok[++i]);
+                else if (tok[i] == "perft" && i + 1 < tok.size()) perftDepth = stoi(tok[++i]);
+                else if (tok[i] == "nopruning") usePruning = false;
+            }
+            if (perftDepth > 0)
+                cout << "nodes " << perft(board, perftDepth) << endl;
+            else
+            {
+                Move best; int score = 0;
+                if (!searchRoot(board, depth, best, score)) { cout << "bestmove 0000" << endl; continue; }
+                cout << "info depth " << depth << " score ";
+                if (abs(score) > MATE - 100) cout << "mate " << (score > 0 ? 1 : -1) * ((MATE - abs(score) + 1) / 2);
+                else cout << "cp " << score;
+                cout << " nodes " << nodes << endl;
+                cout << "bestmove " << moveToStr(best) << endl;
+            }
         }
-        else if (cmd == "quit")
-        {
-            break;
-        }
+        else if (cmd == "quit") break;
     }
 }
 
